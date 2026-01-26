@@ -9,7 +9,7 @@ export interface MCPClient {
   connect(): Promise<void>;
   listTools(): Promise<{ tools: FilteredTool[] }>;
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
-  disconnect(): void;
+  disconnect(): Promise<void>;  // Changed from void
   isConnected(): boolean;
 }
 
@@ -74,10 +74,13 @@ export class UpstreamConnection {
     return await this.client.callTool(name, args);
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
     if (this.connected) {
-      this.client.disconnect();
-      this.connected = false;
+      try {
+        await this.client.disconnect();
+      } finally {
+        this.connected = false;  // Always update state
+      }
     }
   }
 

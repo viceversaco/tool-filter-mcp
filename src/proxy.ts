@@ -59,8 +59,11 @@ export class ProxyOrchestrator {
     return this.upstreamConnection;
   }
 
-  shutdown(): void {
-    this.upstreamConnection.disconnect();
-    this.ready = false;
+  async shutdown(): Promise<void> {
+    try {
+      await this.upstreamConnection.disconnect();
+    } finally {
+      this.ready = false;  // Always update state
+    }
   }
 }

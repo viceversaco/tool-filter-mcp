@@ -8,6 +8,47 @@ import { formatToolsList } from './utils/tool-list-formatter.js';
 import { createUpstreamClient, createStdioUpstreamClient, type WrappedClient } from './client.js';
 import { parseCLIArgs, type CLIArgs } from './cli-args.js';
 import { createProxyConfig } from './config.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+
+/**
+ * Gracefully shutdown proxy and server with timeout safety.
+ * Ensures cleanup completes or times out, never hangs indefinitely.
+ */
+async function gracefulShutdown(
+  proxy: ProxyOrchestrator,
+  server: Server,
+  timeoutMs: number = 5000
+): Promise<void> {
+  const shutdownPromise = (async () => {
+    const errors: string[] = [];
+
+    // Shutdown proxy (disconnects upstream)
+    try {
+      await proxy.shutdown();
+    } catch (error) {
+      errors.push(`Proxy: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // Close MCP server
+    try {
+      await server.close();
+    } catch (error) {
+      errors.push(`Server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (errors.length > 0) {
+      throw new Error(`Cleanup errors: ${errors.join('; ')}`);
+    }
+  })();
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Shutdown timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  await Promise.race([shutdownPromise, timeoutPromise]);
+}
 
 async function listToolsMode(args: CLIArgs): Promise<void> {
   let upstreamClient: WrappedClient | null = null;
@@ -50,7 +91,11 @@ async function listToolsMode(args: CLIArgs): Promise<void> {
     process.exit(1);
   } finally {
     if (upstreamClient) {
-      upstreamClient.disconnect();
+      try {
+        await upstreamClient.disconnect();
+      } catch (error) {
+        console.error(`Cleanup warning: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 }
@@ -105,18 +150,39 @@ async function main(): Promise<void> {
     console.error('MCP proxy server running on stdio');
     console.error('Press Ctrl+C to stop');
 
-    process.on('SIGINT', () => {
-      console.error('\nShutting down...');
-      proxy.shutdown();
-      void server.close();
-      process.exit(0);
-    });
+    let isShuttingDown = false;  // Prevent concurrent shutdown
 
-    process.on('SIGTERM', () => {
-      console.error('\nShutting down...');
-      proxy.shutdown();
-      void server.close();
-      process.exit(0);
+    const handleShutdown = (signal: string) => {
+      if (isShuttingDown) {
+        // Second signal during shutdown = force exit
+        console.error(`\nForce exit (${signal} during shutdown)`);
+        process.exit(1);
+      }
+
+      isShuttingDown = true;
+      console.error(`\nShutting down gracefully (${signal})...`);
+
+      gracefulShutdown(proxy, server, 5000)
+        .then(() => {
+          console.error('Cleanup complete');
+          process.exit(0);
+        })
+        .catch((error) => {
+          console.error(`Cleanup error or timeout: ${(error as Error).message}`);
+          process.exit(1);  // Exit 1 on cleanup failure/timeout
+        });
+    };
+
+    process.on('SIGINT', () => handleShutdown('SIGINT'));
+    process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
+    // Handle parent closing stdio pipe
+    process.on('SIGPIPE', () => {
+      if (!isShuttingDown) {
+        isShuttingDown = true;
+        // Silent exit - stderr may be closed
+        gracefulShutdown(proxy, server, 2000).finally(() => process.exit(0));
+      }
     });
   } catch (error) {
     const errorMessage = formatStartupError(error);

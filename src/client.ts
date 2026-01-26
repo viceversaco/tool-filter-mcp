@@ -15,7 +15,7 @@ export interface WrappedClient {
   connect(): Promise<void>;
   listTools(): Promise<{ tools: Tool[] }>;
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
-  disconnect(): void;
+  disconnect(): Promise<void>;  // Changed from void
   isConnected(): boolean;
 }
 
@@ -266,14 +266,45 @@ export async function createUpstreamClient(
     async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
       return await client.callTool({ name, arguments: args });
     },
-    disconnect(): void {
+    async disconnect(): Promise<void> {
+      const errors: Error[] = [];
+
+      // Step 1: Terminate HTTP session if applicable
       if (activeTransport instanceof StreamableHTTPClientTransport) {
-        void activeTransport.terminateSession().catch(() => undefined);
+        try {
+          await activeTransport.terminateSession();
+        } catch (error) {
+          errors.push(error instanceof Error ? error : new Error(String(error)));
+        }
       }
 
-      void client.close();
+      // Step 2: Close the transport (for both SSE and Streamable)
+      if (activeTransport !== null) {
+        try {
+          await activeTransport.close();
+        } catch (error) {
+          errors.push(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+
+      // Step 3: Close the MCP client
+      try {
+        await client.close();
+      } catch (error) {
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+
+      // Step 4: Update state (always, even if errors)
       connected = false;
       activeTransport = null;
+
+      // Step 5: Report aggregated error if any occurred
+      if (errors.length > 0) {
+        const message = errors.length === 1
+          ? errors[0].message
+          : `Multiple cleanup errors: ${errors.map(e => e.message).join('; ')}`;
+        throw new Error(message);
+      }
     },
     isConnected(): boolean {
       return connected;
@@ -320,10 +351,36 @@ export async function createStdioUpstreamClient(
       return await client.callTool({ name, arguments: args });
     },
 
-    disconnect(): void {
-      void client.close();
+    async disconnect(): Promise<void> {
+      const errors: Error[] = [];
+
+      // Step 1: Close the transport (terminates child process)
+      if (transport !== null) {
+        try {
+          await transport.close();  // CRITICAL: This terminates the spawned process
+        } catch (error) {
+          errors.push(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+
+      // Step 2: Close the MCP client
+      try {
+        await client.close();
+      } catch (error) {
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+
+      // Step 3: Update state (always, even if errors)
       connected = false;
       transport = null;
+
+      // Step 4: Report aggregated error if any occurred
+      if (errors.length > 0) {
+        const message = errors.length === 1
+          ? errors[0].message
+          : `Multiple cleanup errors: ${errors.map(e => e.message).join('; ')}`;
+        throw new Error(message);
+      }
     },
 
     isConnected(): boolean {
