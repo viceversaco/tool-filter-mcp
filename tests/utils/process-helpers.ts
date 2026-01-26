@@ -72,26 +72,47 @@ export async function waitForExit(
 }
 
 /**
- * Wait for specific output pattern on a stream
+ * Wait for specific output pattern on a process's stdout/stderr
  */
 export async function waitForOutput(
-  stream: NodeJS.ReadableStream,
+  proc: ChildProcess,
   pattern: string | RegExp,
   timeout: number
-): Promise<string> {
+): Promise<RegExpMatchArray | null> {
   return new Promise((resolve, reject) => {
     let output = '';
     const timer = setTimeout(() => reject(new Error('Pattern not found')), timeout);
 
-    stream.on('data', (data) => {
+    const dataHandler = (data: Buffer) => {
       output += data.toString();
-      const match = typeof pattern === 'string'
-        ? output.includes(pattern)
-        : pattern.test(output);
-      if (match) {
-        clearTimeout(timer);
-        resolve(output);
+      if (typeof pattern === 'string') {
+        if (output.includes(pattern)) {
+          clearTimeout(timer);
+          cleanup();
+          resolve([pattern]);
+        }
+      } else {
+        const match = output.match(pattern);
+        if (match) {
+          clearTimeout(timer);
+          cleanup();
+          resolve(match);
+        }
       }
+    };
+
+    const cleanup = () => {
+      proc.stdout?.off('data', dataHandler);
+      proc.stderr?.off('data', dataHandler);
+    };
+
+    proc.stdout?.on('data', dataHandler);
+    proc.stderr?.on('data', dataHandler);
+
+    proc.on('exit', () => {
+      cleanup();
+      clearTimeout(timer);
+      reject(new Error('Process exited before pattern found'));
     });
   });
 }

@@ -151,8 +151,15 @@ async function main(): Promise<void> {
     console.error('Press Ctrl+C to stop');
 
     let isShuttingDown = false;  // Prevent concurrent shutdown
+    let parentMonitor: NodeJS.Timeout | null = null;  // Parent death monitor
 
     const handleShutdown = (signal: string) => {
+      // Clear parent monitor if running
+      if (parentMonitor !== null) {
+        clearInterval(parentMonitor);
+        parentMonitor = null;
+      }
+
       if (isShuttingDown) {
         // Second signal during shutdown = force exit
         console.error(`\nForce exit (${signal} during shutdown)`);
@@ -175,15 +182,37 @@ async function main(): Promise<void> {
 
     process.on('SIGINT', () => handleShutdown('SIGINT'));
     process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+    process.on('SIGHUP', () => handleShutdown('SIGHUP'));
 
     // Handle parent closing stdio pipe
     process.on('SIGPIPE', () => {
       if (!isShuttingDown) {
         isShuttingDown = true;
+        if (parentMonitor !== null) {
+          clearInterval(parentMonitor);
+          parentMonitor = null;
+        }
         // Silent exit - stderr may be closed
         gracefulShutdown(proxy, server, 2000).finally(() => process.exit(0));
       }
     });
+
+    // Monitor parent process ID to detect parent death
+    // When parent dies, child gets reparented to init (ppid changes)
+    const originalPPID = process.ppid;
+    parentMonitor = setInterval(() => {
+      if (process.ppid !== originalPPID) {
+        console.error(`\nParent process died (PPID: ${originalPPID} → ${process.ppid})`);
+        clearInterval(parentMonitor!);
+        parentMonitor = null;
+
+        if (!isShuttingDown) {
+          isShuttingDown = true;
+          // Shorter timeout since parent is already gone
+          gracefulShutdown(proxy, server, 2000).finally(() => process.exit(0));
+        }
+      }
+    }, 1000);  // Check every second
   } catch (error) {
     const errorMessage = formatStartupError(error);
     console.error(`Error: ${errorMessage}`);
